@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/rustfox-dom", "crates/rustfox-style"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+debug = true        # symbols for FlameGraph
+lto = "thin"
+codegen-units = 1

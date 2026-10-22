@@ -1,0 +1,8 @@
+[package]
+name = "rustfox-dom"
+version.workspace = true
+edition.workspace = true
+description = "Arena-based DOM with string interning for the rustfox engine sandbox"
+
+[dependencies]
+rustc-hash = "2"

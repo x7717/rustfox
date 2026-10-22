@@ -1,0 +1,20 @@
+{
+  "version": "v0.4-indexed-flat-bloom",
+  "date": "2026-10-22",
+  "machine": "sandbox 2 vCPU, rustc 1.99.1, release profile (thin LTO)",
+  "fixture": "synthetic DOM 10k/2k nodes (depth 12, 8 tags, 64 classes, seed 42), 200 selectors (seed 42)",
+  "results": {
+    "style_pass/naive/2000_ms": 2.3019,
+    "style_pass/optimized_bloom/2000_ms": 2.4760,
+    "style_pass/indexed/2000_us": 437.98,
+    "style_pass/naive/10000_ms": 11.794,
+    "style_pass/optimized_bloom/10000_ms": 12.402,
+    "style_pass/indexed/10000_ms": 2.6482,
+    "parse/200_selectors_us": 90.198
+  },
+  "speedup_vs_naive": {
+    "2000_nodes": 5.26,
+    "10000_nodes": 4.45
+  },
+  "notes": "v0.4 = subject bucketing (rule hash) + ancestor bloom gate + flat zero-alloc output. History: v0.3 indexed nested output 762.95us/4.0901ms."
+}

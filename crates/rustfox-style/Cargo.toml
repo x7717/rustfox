@@ -1,0 +1,16 @@
+[package]
+name = "rustfox-style"
+version.workspace = true
+edition.workspace = true
+description = "CSS selector parsing and matching engine (hot path) — naive vs optimized implementations"
+
+[dependencies]
+rustfox-dom = { path = "../rustfox-dom" }
+rustc-hash = "2"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "selectors"
+harness = false

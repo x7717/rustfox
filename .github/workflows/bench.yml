@@ -1,0 +1,53 @@
+name: benchmarks
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # daily performance drift tracking
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run benchmarks (bencher output)
+        run: |
+          cargo bench --bench selectors -- --output-format bencher | tee bench_out.txt
+
+      - name: Build results JSON
+        run: |
+          python3 - <<'PY'
+          import json, re, datetime, os
+          results = {}
+          for line in open("bench_out.txt"):
+              m = re.match(r"test (\S+)\s+\.\.\. bench:\s+([\d,]+) ns/iter", line)
+              if m:
+                  results[m.group(1)] = round(int(m.group(2).replace(",", "")) / 1e6, 4)
+          data = {
+              "version": "ci-" + os.environ.get("GITHUB_SHA", "local")[:8],
+              "date": datetime.datetime.utcnow().isoformat(),
+              "machine": "github-actions ubuntu-latest",
+              "results_ms": results,
+          }
+          os.makedirs("bench", exist_ok=True)
+          json.dump(data, open("bench/ci-latest.json", "w"), indent=2)
+          print(json.dumps(data, indent=2))
+          PY
+
+      - name: Commit results to bench-results branch
+        run: |
+          git config user.name "rustfox-bench-bot"
+          git config user.email "actions@github.com"
+          git fetch origin bench-results || true
+          git checkout bench-results 2>/dev/null || git checkout --orphan bench-results
+          git rm -rf . 2>/dev/null || true
+          git add -f bench/ci-latest.json
+          git commit -m "bench results $(date -u +%Y-%m-%dT%H:%M:%SZ) [skip ci]" || echo "nothing to commit"
+          git push origin bench-results

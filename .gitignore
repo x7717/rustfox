@@ -1,0 +1,6 @@
+/target
+Cargo.lock
+flamegraph.svg
+perf.data
+perf_stat.txt
+bench_out.txt

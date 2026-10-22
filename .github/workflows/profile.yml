@@ -1,0 +1,44 @@
+name: profile
+
+on:
+  schedule:
+    - cron: "0 4 * * 1"   # weekly flamegraph
+  workflow_dispatch:
+
+jobs:
+  flamegraph:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install perf
+        run: sudo apt-get update && sudo apt-get install -y linux-tools-common linux-tools-generic
+
+      - name: Allow perf events
+        run: sudo sysctl -w kernel.perf_event_paranoid=-1
+
+      - name: Build benches (release, with symbols)
+        run: cargo build --release --benches
+
+      - name: perf stat summary
+        run: |
+          BIN=$(ls target/release/deps/selectors-* | grep -v '\.d$' | head -1)
+          sudo perf stat -e cycles,instructions,cache-misses,branch-misses $BIN --bench | tee perf_stat.txt || true
+
+      - name: Flamegraph
+        run: |
+          cargo install flamegraph
+          BIN=$(ls target/release/deps/selectors-* | grep -v '\.d$' | head -1)
+          sudo perf record -F 299 -g -o perf.data -- $BIN --bench
+          perf script -i perf.data | ~/.cargo/bin/flamegraph --output flamegraph.svg || true
+          test -s flamegraph.svg || echo "flamegraph empty; keeping perf.data"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flamegraph
+          path: |
+            flamegraph.svg
+            perf_stat.txt
