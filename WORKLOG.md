@@ -99,3 +99,14 @@ subject-классы перепроверяются локально, и тол�
    - rayon-параллельный обход поддеревьев (осторожно: bloom-фильтр — общее состояние);
    - SIMD-сравнение классов (AVX2) для compound с 2+ классами.
 5. Обновить `bench/latest.json` и дописать новую итерацию сюда.
+
+---
+
+## Инфраструктура (статус на 2026-10-22)
+
+- CI на main: **зелёный** (fmt, clippy -D warnings, 12 тестов, компиляция бенчей)
+- bench.yml: ежедневный criterion-прогон по cron `0 3 * * *`, результаты коммитятся в ветку `bench-results` — трекинг дрейфа производительности
+- profile.yml: еженедельный flamegraph по понедельникам, артефактом
+- Смежно: CI форка Firefox (x7717/gecko-dev) зелёный на Rust-ядре WebRender
+  (`cargo check -p webrender -p webrender_api -p wr_glyph_rasterizer -p wrench` + `cargo test -p webrender --lib`);
+  history падений задокументирована: freetype2 → добавлен в CI; example-compositor'ы требуют оконные зависимости → исключены из проверки ядра
