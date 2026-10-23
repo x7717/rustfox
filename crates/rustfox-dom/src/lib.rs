@@ -27,6 +27,10 @@ impl Interner {
         &self.names[id as usize]
     }
 
+    pub fn probe(&self, name: &str) -> Option<u32> {
+        self.map.get(name).copied()
+    }
+
     pub fn len(&self) -> usize {
         self.names.len()
     }
@@ -79,6 +83,11 @@ impl Dom {
 
     pub fn class_name(&self, id: ClassId) -> &str {
         self.classes.name(id.0)
+    }
+
+    /// Debug helper: id of an already-interned class.
+    pub fn intern_class_probe(&self, name: &str) -> Option<u32> {
+        self.classes.probe(name)
     }
 
     pub fn create_element(&mut self, tag: &str, classes: &[&str]) -> NodeId {

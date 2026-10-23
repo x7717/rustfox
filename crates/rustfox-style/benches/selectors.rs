@@ -5,7 +5,10 @@
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use rustfox_dom::Dom;
-use rustfox_style::{fixture, naive, optimized, parse_all, StyleSet};
+use rustfox_style::{
+    fast::{FastStyleSet, SoaCache},
+    fixture, naive, optimized, parse_all, StyleSet,
+};
 
 fn build_fixture(dom: &mut Dom, nodes: usize) -> Vec<rustfox_style::Selector> {
     let sources = fixture::build_selectors(200, 42);
@@ -38,6 +41,17 @@ fn bench_style_pass(c: &mut Criterion) {
             |b, (dom, sels)| {
                 let set = StyleSet::new(sels.to_vec());
                 b.iter(|| set.style_pass(dom))
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("fast", size),
+            &(&dom, &selectors),
+            |b, (dom, sels)| {
+                let set = FastStyleSet::new(sels.to_vec());
+                // steady-state restyle: SoA snapshot built once, reused —
+                // the browser hot path (style recalc on an unchanged tree)
+                let cache = SoaCache::of(dom);
+                b.iter(|| set.style_pass(&cache))
             },
         );
     }

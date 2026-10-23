@@ -12,8 +12,11 @@
 use crate::parser::Compound;
 
 /// 32 words × 64 bits = 2048 bits.
-const WORDS: usize = 32;
+pub const WORDS: usize = 32;
 const BITS: u64 = (WORDS * 64) as u64;
+
+/// Full Copy snapshot of the filter state (256 bytes, no heap).
+pub type BloomSnapshot = [u64; WORDS];
 
 #[inline]
 fn bit_for(id: u32) -> (usize, u64) {
@@ -46,6 +49,44 @@ impl AncestorBloom {
             frame.saved.push((wi, self.words[wi]));
             self.words[wi] |= mask;
         }
+    }
+
+    /// Insert one id directly (v0.5 snapshot API; no per-node `Frame` alloc).
+    #[inline]
+    pub fn insert(&mut self, id: u32) {
+        let (wi, mask) = bit_for(id);
+        self.words[wi] |= mask;
+    }
+
+    /// Copy the whole filter state out (256 bytes on the stack).
+    #[inline]
+    pub fn snapshot(&self) -> BloomSnapshot {
+        self.words
+    }
+
+    /// Restore a previously taken snapshot.
+    #[inline]
+    pub fn restore(&mut self, snap: BloomSnapshot) {
+        self.words = snap;
+    }
+
+    /// Gate check against precomputed compound data: tag + class bitmask
+    /// (ids < 128) + spilled high-id classes. Never rejects a matchable
+    /// compound (no false negatives).
+    pub fn may_match_info(&self, tag: Option<u32>, mask: u128, hi: &[u32]) -> bool {
+        if let Some(t) = tag {
+            if !self.contains(t) {
+                return false;
+            }
+        }
+        let mut m = mask;
+        while m != 0 {
+            if !self.contains(m.trailing_zeros()) {
+                return false;
+            }
+            m &= m - 1;
+        }
+        hi.iter().all(|&c| self.contains(c))
     }
 
     /// Push one node: insert its tag and class bits. Returns a frame for `pop`.

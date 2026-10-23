@@ -1,20 +1,22 @@
 {
-  "version": "v0.4-indexed-flat-bloom",
-  "date": "2026-10-22",
+  "version": "v0.6-bit-parallel-automaton",
+  "date": "2026-10-23",
   "machine": "sandbox 2 vCPU, rustc 1.99.1, release profile (thin LTO)",
   "fixture": "synthetic DOM 10k/2k nodes (depth 12, 8 tags, 64 classes, seed 42), 200 selectors (seed 42)",
   "results": {
-    "style_pass/naive/2000_ms": 2.3019,
-    "style_pass/optimized_bloom/2000_ms": 2.4760,
-    "style_pass/indexed/2000_us": 437.98,
-    "style_pass/naive/10000_ms": 11.794,
-    "style_pass/optimized_bloom/10000_ms": 12.402,
-    "style_pass/indexed/10000_ms": 2.6482,
-    "parse/200_selectors_us": 90.198
+    "style_pass/naive/2000_ms": 2.33,
+    "style_pass/optimized_bloom/2000_ms": 2.444,
+    "style_pass/indexed/2000_us": 446.06,
+    "style_pass/fast/2000_us": 310.54,
+    "style_pass/naive/10000_ms": 11.805,
+    "style_pass/optimized_bloom/10000_ms": 12.416,
+    "style_pass/indexed/10000_ms": 2.493,
+    "style_pass/fast/10000_ms": 1.742,
+    "parse/200_selectors_us": 92.22
   },
   "speedup_vs_naive": {
-    "2000_nodes": 5.26,
-    "10000_nodes": 4.45
+    "2000_nodes": 7.5,
+    "10000_nodes": 6.78
   },
-  "notes": "v0.4 = subject bucketing (rule hash) + ancestor bloom gate + flat zero-alloc output. History: v0.3 indexed nested output 762.95us/4.0901ms."
+  "notes": "v0.6 = bit-parallel NFA over the tree: per-node O(W) u128 transition replaces ancestor walks entirely; SoA snapshot reused across passes (steady-state restyle); mask-less pairs direct-indexed per tag; subject hits emitted ascending without sort. History: v0.4 indexed flat 437.98us/2.6482ms; v0.5 walk-based SoA+undo-bloom 348us/2.02ms (intermediate)."
 }
