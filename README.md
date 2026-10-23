@@ -8,28 +8,34 @@ Firefox-подход к оптимизации браузерных hot-path н�
 | крейт | назначение |
 |---|---|
 | `rustfox-dom` | arena-DOM с интернированием строк (теги/классы → `u32`) — сравнения в hot path целочисленные, как atom table в Stylo |
-| `rustfox-style` | парсер CSS-селекторов + матчеры: `naive` (база), `optimized` (bloom-фильтр предков), `indexed` (rule bucketing), `fast` (v0.7: бит-параллельный NFA + AVX2 + zero-copy parent reads), `fast_okc` (direct-mapped ok-cache) |
+| `rustfox-style` | парсер CSS-селекторов + матчеры: `naive` (база), `optimized` (bloom-фильтр предков), `indexed` (rule bucketing), `fast` (v0.8: бит-параллельный NFA + AVX2 + **инкрементальный restyle** по dirty-поддеревьям на preorder), `fast_okc` (direct-mapped ok-cache) |
 | `rustfox-simd` | AVX2/SSE2/SWAR байт-сканирование с кэшем детекции фич и гибридным диспатчем по длине — memchr-слой всех остальных ядер |
-| `rustfox-url` | zero-copy URL-парсер (kernel nsStandardURL): только Range-индексы, ноль аллокаций |
-| `rustfox-html` | zero-copy SIMD HTML-токенизатор (kernel nsHtml5Tokenizer): scratch-Attrs, 0 аллокаций на токен |
+| `rustfox-url` | zero-copy URL-парсер (kernel nsStandardURL): **однопроходный bitmap-движок** (7 структурных байтов за один SIMD-проход), только Range-индексы, ноль аллокаций |
+| `rustfox-html` | zero-copy HTML-токенизатор (kernel nsHtml5Tokenizer): pull-API + **fused-движок** (плоская арена событий, один слитный цикл), 0 аллокаций |
 | `rustfox-http1` | zero-copy HTTP/1.1 заголовки (kernel necko): статус сдвигами, inline×32 + spill |
 
 Текущие результаты (локальный прогон, полный лог — [WORKLOG.md](WORKLOG.md),
 свежие цифры — [bench/latest.json](bench/latest.json)):
 
-| ядро | rf | naive | выигрыш |
+| ядро | rf | naive/база | выигрыш |
 |---|---|---|---|
-| style_pass @2k | 289 µs | 2.30 ms | **7.96x** |
-| style_pass @10k | 1.60 ms | 12.0 ms | **7.52x** |
-| http1/parse (1 MiB) | 753 µs | 1.39 ms | **1.85x** |
-| html/tokenize prose (489 KiB) | 100 µs | 186 µs | **1.86x** |
-| html/tokenize dense | 441 µs | 321 µs | 0.73x (честно: token-dense разметка ниже SIMD break-even) |
-| url/parse (202 KiB) | 145 µs | 166 µs | **1.15x** |
-| simd find_byte 4k | 84 ns | 1.18 µs | **14.1x** |
+| style_pass @2k | 287 µs | 2.31 ms | **8.04x** |
+| style_pass @10k | 1.60 ms | 11.8 ms | **7.35x** |
+| restyle 1% dirty @10k | 218 µs | 1.59 ms (full recalc) | **7.3x** |
+| restyle 0.1% dirty @10k | 168 µs | 1.59 ms | **9.4x** |
+| url/parse (202 KiB, bitmap) | 102 µs | 172 µs | **1.68x** |
+| http1/parse (1 MiB) | 695 µs | 1.40 ms | **2.01x** |
+| html/tokenize prose | 97 µs | 194 µs | **1.99x** |
+| html/tokenize dense | 410 µs | 335 µs | 0.82x (честно: materialize-налог арены, скан ≈ naive на ранах 1–15B) |
+| simd find_byte 4k | 83 ns | 1.17 µs | **14.0x** |
 
 Архитектура `fast` — топ-даун бит-параллельный автомат: переход O(W) u128/AVX2
 операций на узел вместо обходов предков, SoA-снапшот DOM переиспользуется между
-проходами, parent-стейт читается из store без копий.
+проходами, parent-стейт читается из store без копий. Датафлоу строго
+parent → child, поэтому v0.8 умеет инкрементальный restyle: класс изменился —
+пересчитывается только поддерево (поддерево = непрерывный диапазон в
+preorder), чистые узлы копируются memcpy, парити с полным проходом —
+бит-в-байт (matched sets и StateStore).
 
 ## Быстрый старт
 

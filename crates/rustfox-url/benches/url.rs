@@ -1,15 +1,20 @@
 //! Criterion benchmark: zero-copy URL parsing vs an honest naive baseline.
 //!
-//! `rf` — `rustfox_url::Url::parse` (SIMD splits, zero-copy, lazy host
-//! lowercase) + extract `host().len() + path().len()`.
-//! `naive` — a straightforward byte-by-byte parser with the *same component
-//! semantics*, written inline below with plain loops and `str` splits only.
+//! Four engines under the same workload (`host().len() + path().len()` over
+//! the same 2000 fixture URLs):
 //!
-//! Both extract identical (host, path) slices for every fixture URL; the
-//! setup asserts byte equality so the comparison stays honest. If a fixture
-//! URL were to hit a semantic corner the naive mirror does not implement,
-//! the parity check below skips it (currently: none — all four fixture
-//! families are within the shared semantics).
+//! * `rf` — `Url::parse`, the production entry point (currently backed by
+//!   the one-pass bitmap engine, see `parse_bitmap`).
+//! * `bitmap` — `Url::parse_bitmap`: ONE AVX2/SSE2 sweep classifies all
+//!   structural bytes (`:` `/` `?` `#` `@` `[` `]`) into per-32-byte-chunk
+//!   u32 masks; every component is derived from one ordered mask walk.
+//! * `scans` — `Url::parse_scans`: the v0.7 split-by-searching engine
+//!   (`find_any2`/`find_byte` per boundary), kept as the comparison baseline.
+//! * `naive` — a straightforward byte-by-byte parser with the *same
+//!   component semantics*, written inline below with plain loops only.
+//!
+//! Setup asserts byte equality of host/path (rf vs naive, all components
+//! bitmap vs rf) for every fixture URL so the comparison stays honest.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use rustfox_url::Url;
@@ -169,7 +174,7 @@ fn bench_url(c: &mut Criterion) {
     let urls = build_urls();
     let total: u64 = urls.iter().map(|u| u.len() as u64).sum();
 
-    // Setup parity assertion: rf and naive must extract identical
+    // Setup parity assertion 1: rf and naive must extract identical
     // host/path for every URL where both succeed. A URL where only one
     // side succeeds would be skipped and documented here; currently
     // unreachable — all fixture families share semantics.
@@ -187,6 +192,28 @@ fn bench_url(c: &mut Criterion) {
         "fixture must be fully covered by both parsers"
     );
 
+    // Setup parity assertion 2: the bitmap engine must agree with the v0.7
+    // scan engine on ALL components of every fixture URL.
+    for u in &urls {
+        let scans = Url::parse_scans(u).expect("fixture must parse (scans)");
+        let bitmap = Url::parse_bitmap(u).expect("fixture must parse (bitmap)");
+        assert_eq!(scans.scheme(), bitmap.scheme(), "scheme mismatch on {u}");
+        assert_eq!(
+            scans.userinfo(),
+            bitmap.userinfo(),
+            "userinfo mismatch on {u}"
+        );
+        assert_eq!(scans.host(), bitmap.host(), "host mismatch on {u}");
+        assert_eq!(scans.port(), bitmap.port(), "port mismatch on {u}");
+        assert_eq!(scans.path(), bitmap.path(), "path mismatch on {u}");
+        assert_eq!(scans.query(), bitmap.query(), "query mismatch on {u}");
+        assert_eq!(
+            scans.fragment(),
+            bitmap.fragment(),
+            "fragment mismatch on {u}"
+        );
+    }
+
     let mut group = c.benchmark_group("url/parse");
     group.sample_size(20);
     group.warm_up_time(Duration::from_millis(300));
@@ -196,6 +223,24 @@ fn bench_url(c: &mut Criterion) {
         b.iter(|| {
             for u in &urls {
                 let url = Url::parse(u).unwrap();
+                black_box(url.host().len() + url.path().len());
+            }
+        })
+    });
+
+    group.bench_function("bitmap", |b| {
+        b.iter(|| {
+            for u in &urls {
+                let url = Url::parse_bitmap(u).unwrap();
+                black_box(url.host().len() + url.path().len());
+            }
+        })
+    });
+
+    group.bench_function("scans", |b| {
+        b.iter(|| {
+            for u in &urls {
+                let url = Url::parse_scans(u).unwrap();
                 black_box(url.host().len() + url.path().len());
             }
         })

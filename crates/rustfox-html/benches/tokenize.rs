@@ -1,20 +1,27 @@
 //! Criterion benchmark: SIMD zero-copy tokenizer vs a naive byte-wise scan.
 //!
-//! `rf-simd` — `rustfox_html::Tokenizer` over the whole page: counts tokens
-//! by type and iterates every start tag's attributes through the scratch
-//! `Attrs` buffer (the allocation-free hot path).
+//! Three implementations with identical simplified-HTML5 semantics:
 //!
-//! `naive-bytewise` — an equally correct, deliberately dumb byte-by-byte
-//! scanner with the same simplified HTML5 semantics (no SIMD, no slices
-//! cache tricks), counting the same aggregates.
+//! * `rf-simd` — the pull `Tokenizer::next_token` API over the whole page
+//!   (one call per token, scratch `Attrs` buffer, counts inline).
+//! * `rf-fused` — `tokenize_into` into one **reused** flat `TokenBuf`
+//!   arena: a single pass with no per-token calls (events + attributes
+//!   pushed into flat vectors during the scan), then one aggregation
+//!   pass over the events.
+//! * `naive-bytewise` — an equally correct, deliberately dumb byte-by-byte
+//!   scanner with the same semantics (no SIMD, no slices, no arena),
+//!   counting the same aggregates inline.
 //!
-//! The setup runs both once and asserts that all six aggregate counters
-//! (text/start/end/comment/doctype/attrs) match — otherwise it panics with
-//! the mismatching counters, so the numbers can never compare apples to
-//! oranges.
+//! The setup runs all three once and asserts that all six aggregate
+//! counters (text/start/end/comment/doctype/attrs) match across them —
+//! otherwise it panics with the mismatching counters, so the numbers can
+//! never compare apples to oranges.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use rustfox_html::{Attrs, Token, Tokenizer};
+use rustfox_html::{
+    tokenize, tokenize_into, Attrs, Token, TokenBuf, Tokenizer, KIND_COMMENT, KIND_DOCTYPE,
+    KIND_END_TAG, KIND_START_TAG, KIND_TEXT,
+};
 use std::time::Duration;
 
 /// Deterministic LCG (mirrors rustfox-style fixture.rs, no `rand` dep).
@@ -138,6 +145,30 @@ fn count_with_rf(page: &[u8]) -> Counts {
         }
     }
     c
+}
+
+/// Aggregate counters from a fused event arena.
+fn counts_from_events(buf: &TokenBuf) -> Counts {
+    let mut c = Counts::default();
+    for e in &buf.events {
+        match e.kind_base() {
+            KIND_TEXT => c.text += 1,
+            KIND_START_TAG => {
+                c.start += 1;
+                c.attrs += e.d as u64;
+            }
+            KIND_END_TAG => c.end += 1,
+            KIND_COMMENT => c.comment += 1,
+            KIND_DOCTYPE => c.doctype += 1,
+            other => unreachable!("corrupt event kind {other:#x}"),
+        }
+    }
+    c
+}
+
+/// Reference run of the fused tokenizer, counting the same aggregates.
+fn count_with_fused(page: &[u8]) -> Counts {
+    counts_from_events(&tokenize(page))
 }
 
 /// Honest naive baseline: byte-by-byte scanner with the same simplified
@@ -276,13 +307,18 @@ fn bench_tokenize(c: &mut Criterion) {
     let dense = build_page_dense();
     let prose = build_page_prose();
 
-    // Setup parity: both implementations must agree on every aggregate.
+    // Setup parity: all three implementations must agree on every aggregate.
     for (name, page) in [("dense", &dense), ("prose", &prose)] {
         let rf = count_with_rf(page);
+        let fused = count_with_fused(page);
         let naive = count_with_naive(page);
         assert_eq!(
+            rf, fused,
+            "rf-pull and rf-fused disagree on aggregate token counts ({name})"
+        );
+        assert_eq!(
             rf, naive,
-            "rf-simd and naive-bytewise disagree on aggregate token counts ({name})"
+            "rf-pull and naive-bytewise disagree on aggregate token counts ({name})"
         );
         assert!(rf.start > 0 && rf.attrs > 0, "fixture {name} is empty");
     }
@@ -315,6 +351,16 @@ fn bench_tokenize(c: &mut Criterion) {
                     }
                 }
                 black_box(c)
+            })
+        });
+        let mut buf = TokenBuf::new();
+        group.bench_function(format!("rf-fused/{name}"), |b| {
+            b.iter(|| {
+                // Steady-state fused usage: one reused arena, zero
+                // allocations per parse (mirrors the scratch `Attrs`
+                // reuse pattern of the pull tokenizer).
+                tokenize_into(page, &mut buf);
+                black_box(counts_from_events(&buf))
             })
         });
         group.bench_function(format!("naive-bytewise/{name}"), |b| {

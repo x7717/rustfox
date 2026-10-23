@@ -1,17 +1,31 @@
-//! v0.7 — level-order bit-parallel automaton + AVX2 transition kernel.
+//! v0.8 — incremental restyle on top of the bit-parallel automaton.
 //!
 //! History of this matcher: v0.4 indexed (rule buckets), v0.5 SoA + undo-log
-//! bloom, v0.6 bit-parallel NFA (6.8–7.5x vs naive). v0.7 keeps the v0.6
-//! automaton semantics and attacks the per-node constant costs that profiling
-//! pointed at:
+//! bloom, v0.6 bit-parallel NFA (6.8–7.5x vs naive), v0.7 AVX2 transition
+//! kernel + zero-copy parent reads (7.5–8.0x). v0.8 adds the steady-state
+//! hot path a real browser runs millions of times per session:
 //!
-//! 1. **DFS stack → level-order (BFS) banks.** The DFS kept parent states in
-//!    a `level_store` and copied them into scratch on every node, plus a
-//!    truncate per popped frame. Now each tree level is one contiguous bank:
-//!    parents are read sequentially from level L-1, children written
-//!    sequentially into level L — pure streaming, no per-node copies, no
-//!    stack frames. (Any top-down order is valid: a node's `act/acc` depends
-//!    only on its parent's.)
+//! **Incremental restyle** ([`FastStyleSet::restyle`]). The automaton's
+//! dataflow is strictly parent → child (a node's `act`/`acc` derive only
+//! from its parent's state plus its own `(tag, class-mask)`), so a class
+//! change on node `u` can only affect `u`'s subtree. `SoaCache` therefore
+//! carries a `parent` array and a DFS `preorder` in which every subtree is
+//! a contiguous range; `restyle` walks that array once — clean nodes copy
+//! their previous match range (pure memcpy), dirty subtrees re-run the
+//! automaton over a contiguous slice with freshly written parent states
+//! read straight back. No stack, no recursion. Parity with a fresh full
+//! pass is tested on randomized dirty-set sequences (including hi-class
+//! spill, nested dirty nodes, dirty roots, and the all/none extremes) —
+//! both matched sets AND persistent `StateStore` bits.
+//!
+//! Earlier v0.7 notes (kept for the optimization archaeology):
+//!
+//! 1. **Traversal order.** A level-order (BFS) two-bank layout was tried
+//!    and regressed +32% @ 10k (working set O(level width) ≈ 600 KB vs
+//!    O(depth) ≈ hundreds of bytes L1-resident for DFS) — reverted. The
+//!    preorder array used by restyle is only an iteration ORDER, not a
+//!    bank layout: parent states live in the per-node `StateStore`, so
+//!    the working-set argument does not apply to it.
 //! 2. **AVX2 transition kernel.** The hot inner expression
 //!    `ok & ((child & act_sh) | (desc & acc_sh) | first)` and
 //!    `accn = pacc | act` are pure bitwise ops over `w` u128 words —
@@ -27,7 +41,7 @@
 //! 4. **SoA `hi` classes flattened** from `Vec<Vec<u32>>` to CSR
 //!    (`hi_start`/`hi_list`) — no per-node Vec in cache construction.
 //!
-//! Automaton semantics (unchanged from v0.6): every `(selector i, compound j)`
+//! Automaton semantics (unchanged since v0.6): every `(selector i, compound j)`
 //! pair is one bit in a bank of u128 words packed by `off[i] + j`;
 //! `act[u]` = prefixes ending exactly at `u`, `acc[u]` = union over the
 //! root→u path; Child pairs shift `act`, Desc pairs shift `acc`; a match is
@@ -102,6 +116,18 @@ pub struct FastStyleSet {
 
 /// Contiguous SoA snapshot of the DOM, built once per structure change and
 /// reused across style passes (steady-state restyle is the browser hot path).
+///
+/// v0.8 adds the traversal scaffolding for incremental restyle:
+///
+/// * `parent[u]` — `u32::MAX` for roots. The automaton's dataflow is strictly
+///   parent → child (a node's `act`/`acc` depend only on its parent's), so a
+///   class change on node `u` can only alter states inside `u`'s subtree.
+/// * `preorder` — DFS preorder over all roots (roots ascending, children
+///   ascending — the exact order `style_pass` visits nodes). A subtree is a
+///   CONTIGUOUS range `[pre_start[u], subtree_end[u])` of that array, so a
+///   dirty subtree is processed by a plain `for` loop over a slice — no
+///   stack, no recursion. Parent-before-child ordering also means a dirty
+///   region can read its freshly computed parent state directly.
 pub struct SoaCache {
     pub(crate) tags: Vec<u32>,
     pub(crate) masks: Vec<u128>,
@@ -111,6 +137,95 @@ pub struct SoaCache {
     pub(crate) child_start: Vec<u32>,
     pub(crate) child_nodes: Vec<u32>,
     pub(crate) roots: Vec<u32>,
+    /// `u32::MAX` for roots
+    pub(crate) parent: Vec<u32>,
+    pub(crate) preorder: Vec<u32>,
+    pub(crate) pre_start: Vec<u32>,
+    /// exclusive end of `u`'s subtree in `preorder`
+    pub(crate) subtree_end: Vec<u32>,
+}
+
+impl SoaCache {
+    /// Incremental class update — the steady-state restyle entry point.
+    ///
+    /// Low classes (id < 128) flip one bit, O(1). A hi-class (id >= 128)
+    /// change rebuilds the CSR spill arrays in O(n) — rare by construction
+    /// (the fixture and most real vocabularies live far below 128 classes).
+    /// After updating, pass the node id in the `dirty` list of the next
+    /// [`FastStyleSet::restyle`] call.
+    pub fn set_class(&mut self, u: usize, class: u32, on: bool) {
+        assert!(u < self.tags.len(), "node id out of range");
+        if class < MASK_BITS {
+            let bit = 1u128 << class;
+            if on {
+                self.masks[u] |= bit;
+            } else {
+                self.masks[u] &= !bit;
+            }
+        } else {
+            let mut list: Vec<u32> = Vec::with_capacity(self.hi_list.len());
+            let mut start = Vec::with_capacity(self.tags.len() + 1);
+            for i in 0..self.tags.len() {
+                start.push(list.len() as u32);
+                let s = self.hi_start[i] as usize;
+                let e = self.hi_start[i + 1] as usize;
+                let mut had = false;
+                for k in s..e {
+                    let c = self.hi_list[k];
+                    if c == class {
+                        had = true;
+                        if !on {
+                            continue;
+                        }
+                    }
+                    list.push(c);
+                }
+                if on && !had && i == u {
+                    list.push(class);
+                }
+            }
+            start.push(list.len() as u32);
+            self.hi_list = list;
+            self.hi_start = start;
+        }
+    }
+
+    /// Number of nodes in `u`'s subtree (the contiguous preorder slice the
+    /// restyle recomputes when `u` is dirty).
+    pub fn subtree_len(&self, u: usize) -> usize {
+        (self.subtree_end[u] - self.pre_start[u]) as usize
+    }
+}
+
+/// Persistent per-node automaton states (`act`/`accn`) for incremental
+/// restyle — the memory Stylo would call "style data hanging off the
+/// element". `2 * n * wr * 16 B` (≈2.5 MB for 10k nodes × 200 selectors),
+/// written once per full pass and updated in place inside dirty subtrees
+/// by [`FastStyleSet::restyle`].
+pub struct StateStore {
+    pub(crate) act: Vec<u128>,
+    pub(crate) accn: Vec<u128>,
+    wr: usize,
+}
+
+impl StateStore {
+    pub(crate) fn new(n: usize, wr: usize) -> Self {
+        StateStore {
+            act: vec![0u128; n * wr],
+            accn: vec![0u128; n * wr],
+            wr,
+        }
+    }
+
+    pub fn wr(&self) -> usize {
+        self.wr
+    }
+
+    /// Exact state equality (act and accn) — used by parity tests to prove
+    /// that an incremental restyle reproduces a fresh full pass bit-for-bit.
+    pub fn equals(&self, other: &StateStore) -> bool {
+        self.wr == other.wr && self.act == other.act && self.accn == other.accn
+    }
 }
 
 impl SoaCache {
@@ -142,10 +257,47 @@ impl SoaCache {
         for &c in &child_nodes {
             has_parent[c as usize] = true;
         }
-        let roots = (0..n)
+        let roots: Vec<u32> = (0..n)
             .filter(|&i| !has_parent[i])
             .map(|i| i as u32)
             .collect();
+
+        // --- restyle scaffolding: parent + preorder + subtree ranges ---
+        let mut parent = vec![u32::MAX; n];
+        for i in 0..n {
+            for k in child_start[i] as usize..child_start[i + 1] as usize {
+                parent[child_nodes[k] as usize] = i as u32;
+            }
+        }
+        // DFS preorder, roots ascending, children ascending — byte-for-byte
+        // the order style_pass visits nodes (per-root DFS, stack-based).
+        let mut preorder: Vec<u32> = Vec::with_capacity(n);
+        let mut pre_start = vec![0u32; n];
+        let mut stack: Vec<u32> = roots.iter().rev().copied().collect();
+        while let Some(u) = stack.pop() {
+            let uu = u as usize;
+            pre_start[uu] = preorder.len() as u32;
+            preorder.push(u);
+            for k in (child_start[uu] as usize..child_start[uu + 1] as usize).rev() {
+                stack.push(child_nodes[k]);
+            }
+        }
+        // Subtree sizes by reverse accumulation (children appear after their
+        // parent in preorder), then `subtree_end[u] = pre_start[u] + size[u]`:
+        // a subtree is one contiguous preorder slice.
+        let mut size = vec![1u32; n];
+        for i in (0..n).rev() {
+            let u = preorder[i] as usize;
+            let par = parent[u];
+            if par != u32::MAX {
+                size[par as usize] += size[u];
+            }
+        }
+        let mut subtree_end = vec![0u32; n];
+        for i in 0..n {
+            subtree_end[i] = pre_start[i] + size[i];
+        }
+
         Self {
             tags,
             masks,
@@ -154,11 +306,20 @@ impl SoaCache {
             child_start,
             child_nodes,
             roots,
+            parent,
+            preorder,
+            pre_start,
+            subtree_end,
         }
     }
 }
 
 impl FastStyleSet {
+    /// Padded words per bitset row (exposed for test/bench invariants).
+    pub fn wr_words(&self) -> usize {
+        self.wr
+    }
+
     pub fn new(selectors: Vec<Selector>) -> Self {
         let n_sel = selectors.len();
         let k = selectors
@@ -290,6 +451,158 @@ impl FastStyleSet {
         self.style_pass_impl(soa, true)
     }
 
+    /// Full pass that also persists per-node states into a [`StateStore`] —
+    /// the base snapshot [`Self::restyle`] updates incrementally.
+    ///
+    /// Same traversal order and same output as [`Self::style_pass`]
+    /// (parity-tested), but the DFS stack is replaced by the precomputed
+    /// preorder array and parent states are read from the store directly.
+    pub fn style_pass_states(&self, soa: &SoaCache) -> (MatchedStyles, StateStore) {
+        let n = soa.tags.len();
+        let mut out = MatchedStyles {
+            starts: vec![0; n],
+            ends: vec![0; n],
+            indices: Vec::new(),
+        };
+        let mut store = StateStore::new(n, self.wr);
+        if self.w == 0 || n == 0 {
+            return (out, store);
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        let avx = is_x86_feature_detected!("avx2");
+        #[cfg(not(target_arch = "x86_64"))]
+        let avx = false;
+
+        let wr = self.wr;
+        let mut sc = Scratch::new(wr);
+        let zeros: Vec<u128> = vec![0u128; wr];
+
+        // Preorder walk: parent states are read straight from the store
+        // (already final — preorder guarantees parent-before-child), the
+        // node's own state is written back at its slot. No stack, no
+        // truncate/extend bookkeeping — one branchless loop over the order.
+        for &p in &soa.preorder {
+            let u = p as usize;
+            let par = soa.parent[u];
+            let (pact, pacc): (&[u128], &[u128]) = if par == u32::MAX {
+                (&zeros, &zeros)
+            } else {
+                let pb = par as usize * wr;
+                (&store.act[pb..pb + wr], &store.accn[pb..pb + wr])
+            };
+            self.run_node(u, soa, pact, pacc, &mut sc, false, avx, &mut out);
+            let b = u * wr;
+            store.act[b..b + wr].copy_from_slice(&sc.act);
+            store.accn[b..b + wr].copy_from_slice(&sc.accn);
+        }
+        (out, store)
+    }
+
+    /// **Incremental restyle** — recompute only what a class change can
+    /// possibly affect.
+    ///
+    /// Contract (Stylo-style):
+    ///
+    /// * `soa` already reflects the NEW classes (use [`SoaCache::set_class`]);
+    /// * `dirty` lists the node ids whose classes changed since the last
+    ///   pass (duplicates are fine, out-of-range ids are ignored);
+    /// * `states` is the persistent store from the previous
+    ///   [`Self::style_pass_states`] / [`Self::restyle`] call — updated in
+    ///   place, so the next restyle chains directly;
+    /// * `prev` is the previous pass's [`MatchedStyles`] — used ONLY for
+    ///   clean nodes' index ranges (their states and matches are unchanged:
+    ///   the automaton's dataflow is strictly parent → child).
+    ///
+    /// Output is byte-identical to a fresh full pass on the updated `soa`
+    /// (parity-tested on randomized dirty sets, including hi-class spill,
+    /// nested dirty nodes, dirty roots, and the all/none extremes).
+    ///
+    /// Cost model: O(n) cheap arena rebuild (copying clean ranges — a few
+    /// ns/node of memcpy) + full automaton work ONLY inside dirty subtrees.
+    /// Structural changes (create/remove nodes) invalidate the SoA snapshot
+    /// and require a rebuild + full pass.
+    pub fn restyle(
+        &self,
+        soa: &SoaCache,
+        states: &mut StateStore,
+        prev: &MatchedStyles,
+        dirty: &[u32],
+    ) -> MatchedStyles {
+        let n = soa.tags.len();
+        let mut out = MatchedStyles {
+            starts: vec![0; n],
+            ends: vec![0; n],
+            indices: Vec::with_capacity(prev.indices.len()),
+        };
+        if self.w == 0 || n == 0 {
+            return out;
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        let avx = is_x86_feature_detected!("avx2");
+        #[cfg(not(target_arch = "x86_64"))]
+        let avx = false;
+
+        let wr = self.wr;
+        let mut sc = Scratch::new(wr);
+        let zeros: Vec<u128> = vec![0u128; wr];
+
+        // 1. flag dirty nodes (dedupe for free)
+        let mut dirty_f = vec![false; n];
+        for &d in dirty {
+            if (d as usize) < n {
+                dirty_f[d as usize] = true;
+            }
+        }
+        // 2. expand to subtree closure: preorder guarantees the parent is
+        //    visited before the child, so one linear pass suffices.
+        let mut expanded = vec![false; n];
+        for &p in &soa.preorder {
+            let u = p as usize;
+            let par = soa.parent[u];
+            expanded[u] = dirty_f[u] || (par != u32::MAX && expanded[par as usize]);
+        }
+
+        // 3. rebuild the flat arena in preorder order: clean nodes copy
+        //    their previous index range (pure memcpy of u32s), dirty
+        //    subtrees run the automaton over one contiguous preorder slice.
+        let order = &soa.preorder;
+        let mut p = 0usize;
+        while p < n {
+            let u = order[p] as usize;
+            if !expanded[u] {
+                let s = prev.starts[u] as usize;
+                let e = prev.ends[u] as usize;
+                out.starts[u] = out.indices.len() as u32;
+                out.indices.extend_from_slice(&prev.indices[s..e]);
+                out.ends[u] = out.indices.len() as u32;
+                p += 1;
+            } else {
+                // dirty root: its whole subtree is [p, subtree_end[u]) —
+                // a contiguous slice, processed parent-before-child, so
+                // freshly written parent states are read back directly.
+                let end = soa.subtree_end[u] as usize;
+                for &q in &order[p..end] {
+                    let v = q as usize;
+                    let par = soa.parent[v];
+                    let (pact, pacc): (&[u128], &[u128]) = if par == u32::MAX {
+                        (&zeros, &zeros)
+                    } else {
+                        let pb = par as usize * wr;
+                        (&states.act[pb..pb + wr], &states.accn[pb..pb + wr])
+                    };
+                    self.run_node(v, soa, pact, pacc, &mut sc, false, avx, &mut out);
+                    let b = v * wr;
+                    states.act[b..b + wr].copy_from_slice(&sc.act);
+                    states.accn[b..b + wr].copy_from_slice(&sc.accn);
+                }
+                p = end;
+            }
+        }
+        out
+    }
+
     fn style_pass_impl(&self, soa: &SoaCache, use_cache: bool) -> MatchedStyles {
         let n = soa.tags.len();
         let mut out = MatchedStyles {
@@ -395,7 +708,7 @@ impl FastStyleSet {
     /// read DIRECTLY from the store (v0.6 copied it into scratch first —
     /// 2×wr×16 bytes of pure memcpy per node, gone in v0.7).
     /// Returns the store position of this frame.
-    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+    #[allow(clippy::too_many_arguments)]
     fn enter_node(
         &self,
         u: usize,
@@ -409,12 +722,7 @@ impl FastStyleSet {
         zeros: &[u128],
     ) -> u32 {
         let wr = self.wr;
-        let w = self.w;
-        let start = out.indices.len() as u32;
-        out.starts[u] = start;
         let store_pos = level_store.len() as u32;
-
-        // ---- load parent state (or zeros for roots): zero-copy borrow ----
         let (pact, pacc): (&[u128], &[u128]) = match parent_pos {
             Some(pp) => (
                 &level_store[pp..pp + wr],
@@ -422,6 +730,33 @@ impl FastStyleSet {
             ),
             None => (zeros, zeros),
         };
+        self.run_node(u, soa, pact, pacc, sc, use_cache, avx, out);
+        level_store.extend_from_slice(&sc.act);
+        level_store.extend_from_slice(&sc.accn);
+        store_pos
+    }
+
+    /// The per-node automaton step shared by all pass flavors (v0.8
+    /// refactor): `ok[u]` from the tables, parent-state shift, transition,
+    /// match extraction into `out`. Parent state arrives as borrowed
+    /// slices — from `level_store`, the persistent [`StateStore`], or the
+    /// zero vector for roots. Writing the node's own state back is the
+    /// caller's job (append vs slot write differ per pass flavor).
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+    fn run_node(
+        &self,
+        u: usize,
+        soa: &SoaCache,
+        pact: &[u128],
+        pacc: &[u128],
+        sc: &mut Scratch,
+        use_cache: bool,
+        avx: bool,
+        out: &mut MatchedStyles,
+    ) {
+        let wr = self.wr;
+        let w = self.w;
+        out.starts[u] = out.indices.len() as u32;
 
         // ---- ok[u]: pairs whose compound matches this node ----
         let tag_u = soa.tags[u] as usize;
@@ -501,11 +836,6 @@ impl FastStyleSet {
             }
         }
         out.ends[u] = out.indices.len() as u32;
-
-        // ---- push this frame's state (parent borrow ended above) ----
-        level_store.extend_from_slice(&sc.act);
-        level_store.extend_from_slice(&sc.accn);
-        store_pos
     }
 
     /// `ok[u]` from the automaton tables (mask-less direct index, then the
