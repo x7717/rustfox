@@ -54,6 +54,16 @@ fn bench_style_pass(c: &mut Criterion) {
                 b.iter(|| set.style_pass(&cache))
             },
         );
+        group.bench_with_input(
+            BenchmarkId::new("fast_okc", size),
+            &(&dom, &selectors),
+            |b, (dom, sels)| {
+                let set = FastStyleSet::new(sels.to_vec());
+                let cache = SoaCache::of(dom);
+                // v0.7 experiment: direct-mapped (tag, mask) -> ok cache
+                b.iter(|| set.style_pass_cached(&cache))
+            },
+        );
     }
     group.finish();
 }

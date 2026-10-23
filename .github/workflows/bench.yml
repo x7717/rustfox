@@ -19,7 +19,7 @@ jobs:
 
       - name: Run benchmarks (bencher output)
         run: |
-          cargo bench --bench selectors -- --output-format bencher | tee bench_out.txt
+          cargo bench --workspace -- --output-format bencher | tee bench_out.txt
 
       - name: Build results JSON
         run: |

@@ -1,0 +1,14 @@
+[package]
+name = "rustfox-simd"
+version.workspace = true
+edition.workspace = true
+description = "SIMD/SWAR byte-scanning primitives for browser hot paths (URL, HTML, HTTP)"
+
+[dependencies]
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "scan"
+harness = false

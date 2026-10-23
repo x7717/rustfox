@@ -1,0 +1,15 @@
+[package]
+name = "rustfox-html"
+version.workspace = true
+edition.workspace = true
+description = "Zero-copy SIMD HTML tokenizer hot path (html5ever kernel)"
+
+[dependencies]
+rustfox-simd = { path = "../rustfox-simd" }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "tokenize"
+harness = false

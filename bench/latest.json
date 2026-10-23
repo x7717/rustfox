@@ -1,22 +1,41 @@
 {
-  "version": "v0.6-bit-parallel-automaton",
+  "version": "v0.7-level-order-avx2-dfs",
   "date": "2026-10-23",
-  "machine": "sandbox 2 vCPU, rustc 1.99.1, release profile (thin LTO)",
+  "machine": "sandbox 2 vCPU, rustc 1.99.1, bench profile (thin LTO, codegen-units=1)",
   "fixture": "synthetic DOM 10k/2k nodes (depth 12, 8 tags, 64 classes, seed 42), 200 selectors (seed 42)",
   "results": {
-    "style_pass/naive/2000_ms": 2.33,
-    "style_pass/optimized_bloom/2000_ms": 2.444,
-    "style_pass/indexed/2000_us": 446.06,
-    "style_pass/fast/2000_us": 310.54,
-    "style_pass/naive/10000_ms": 11.805,
-    "style_pass/optimized_bloom/10000_ms": 12.416,
-    "style_pass/indexed/10000_ms": 2.493,
-    "style_pass/fast/10000_ms": 1.742,
-    "parse/200_selectors_us": 92.22
+    "style_pass/naive/2000_ms": 2.3025,
+    "style_pass/optimized_bloom/2000_ms": 2.4915,
+    "style_pass/indexed/2000_us": 440.45,
+    "style_pass/fast/2000_us": 289.12,
+    "style_pass/fast_okc/2000_us": 296.33,
+    "style_pass/naive/10000_ms": 12.0,
+    "style_pass/optimized_bloom/10000_ms": 12.313,
+    "style_pass/indexed/10000_ms": 2.4869,
+    "style_pass/fast/10000_ms": 1.5958,
+    "style_pass/fast_okc/10000_ms": 1.6638,
+    "parse/200_selectors_us": 93.485,
+    "url/parse/rf_us": 144.83,
+    "url/parse/naive_us": 165.86,
+    "html/tokenize/dense_rf_us": 440.63,
+    "html/tokenize/dense_naive_us": 320.97,
+    "html/tokenize/prose_rf_us": 100.38,
+    "html/tokenize/prose_naive_us": 186.3,
+    "http1/parse/rf_us": 753.14,
+    "http1/parse/naive_us": 1392.7,
+    "simd/find_byte_4k_absent_ns": 83.79,
+    "simd/find_byte_4k_absent_naive_ns": 1180.4,
+    "simd/find_any2_4k_ns": 6.9,
+    "simd/find_any2_4k_naive_ns": 101.0
   },
   "speedup_vs_naive": {
-    "2000_nodes": 7.5,
-    "10000_nodes": 6.78
+    "style_pass/2000_nodes": 7.96,
+    "style_pass/10000_nodes": 7.52,
+    "url/parse": 1.15,
+    "html/tokenize/prose": 1.86,
+    "html/tokenize/dense": 0.73,
+    "http1/parse": 1.85,
+    "simd/find_byte_4k": 14.1
   },
-  "notes": "v0.6 = bit-parallel NFA over the tree: per-node O(W) u128 transition replaces ancestor walks entirely; SoA snapshot reused across passes (steady-state restyle); mask-less pairs direct-indexed per tag; subject hits emitted ascending without sort. History: v0.4 indexed flat 437.98us/2.6482ms; v0.5 walk-based SoA+undo-bloom 348us/2.02ms (intermediate)."
+  "notes": "v0.7 = v0.6 automaton + zero-copy parent-state reads (v0.6 memcpy'd 2*wr*16B per node) + AVX2 transition kernel (2 u128 words per op) + SoA hi-classes CSR + optional direct-mapped (tag,mask)->ok cache (style_pass_cached; loses ~4% on the 30%-repeat fixture, kept for dense real-world vocabularies). BFS level-order banks were tried first and regressed +32% @ 10k (working set O(width) vs O(depth)) - reverted, documented in WORKLOG Iteration 6. New kernels: rustfox-url (zero-copy SIMD parser), rustfox-html (zero-copy tokenizer; wins 1.86x on prose pages, loses 1.37x on token-dense markup where text runs are shorter than the SIMD break-even), rustfox-http1 (zero-copy headers), rustfox-simd (cached feature detection + hybrid length dispatch)."
 }

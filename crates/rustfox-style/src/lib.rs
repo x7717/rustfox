@@ -86,6 +86,25 @@ mod parity {
     }
 
     #[test]
+    fn fast_cached_matches_naive_on_fixture() {
+        // v0.7: level-order banks + AVX2 transition + ok-cache must stay
+        // byte-identical to the naive baseline.
+        let mut dom = Dom::new();
+        fixture::build_dom(&mut dom, 2_000, 10, 1234);
+        let sources = fixture::build_selectors(200, 777);
+        let selectors = parse_all(&mut dom, &sources);
+
+        let a = naive::style_pass(&dom, &selectors);
+        let set = fast::FastStyleSet::new(selectors);
+        let b = set.style_pass_cached(&fast::SoaCache::of(&dom)).to_nested();
+        assert_eq!(a.len(), dom.len());
+        assert_eq!(b.len(), dom.len());
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(x, y, "mismatch at node {i}: naive={x:?} fast_cached={y:?}");
+        }
+    }
+
+    #[test]
     fn fast_handles_high_class_ids_and_tricky_subjects() {
         // Classes with id >= 128 exercise the spill path; universal and
         // classless subjects exercise the `by_class`/`universal` buckets.
