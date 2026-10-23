@@ -1,0 +1,14 @@
+{
+  "version": "ci-7b94ddd1",
+  "date": "2026-10-23T08:28:12.220362",
+  "machine": "github-actions ubuntu-latest",
+  "results_ms": {
+    "style_pass/naive/2000": 2.0431,
+    "style_pass/optimized/2000": 2.0055,
+    "style_pass/indexed/2000": 0.2301,
+    "style_pass/naive/10000": 10.4653,
+    "style_pass/optimized/10000": 10.1939,
+    "style_pass/indexed/10000": 2.1576,
+    "parse/200_selectors": 0.0755
+  }
+}
