@@ -70,6 +70,28 @@
 //! stores per 500 KB page (~113 µs isolated push floor, ~29 µs net
 //! after overlap) plus a ~36 µs consumer pass, where the byte-wise
 //! baseline counts inline with zero extra memory traffic.
+//!
+//! # Streaming API: `for_each_event` (Iteration 8)
+//!
+//! The arena's materialize-then-consume tax is structural — so
+//! [`for_each_event`] removes the materialization instead of tuning it:
+//! the same single-pass fused core (crate-private `tokenize_core`,
+//! monomorphized per `Sink`) hands every event to a user closure at
+//! emission time, with the tag's raw attribute slice attached; nothing
+//! is stored. [`tokenize_into`] is now a thin [`ArenaSink`] backend over
+//! the same core — one scanner behind three APIs (pull / arena /
+//! streaming), and the parity oracle asserts **pull ≡ arena ≡
+//! streaming** on the whole corpus (hand fixtures, truncated inputs,
+//! LCG markup, bench pages).
+//!
+//! Measured (500 KB pages, criterion, same machine): streaming beats
+//! the arena on both fixtures — prose 88.0 µs vs 98.3 (**1.12×**),
+//! dense 383.8 µs vs 405–438 (**1.06–1.14×**) — and is now the fastest
+//! rustfox HTML path: **2.03× over the byte-wise loop on prose**,
+//! 1.13–1.14× over the pull API. On dense markup the residual gap to
+//! the byte-wise loop (0.73×) is the scanner itself on 1–15-byte runs
+//! plus per-event callback dispatch — the Iteration 7 physics, now
+//! isolated from any arena cost.
 
 use rustfox_simd::find_byte;
 
@@ -615,12 +637,104 @@ fn scan_byte(src: &[u8], from: usize, n: usize, needle: u8) -> usize {
     find_byte(&src[j..], needle).map_or(n, |off| j + off)
 }
 
-/// Fused tokenizer: a **single** pass over `src` emitting flat
-/// [`Event`]s and attribute ranges into `buf` — no per-token calls, no
-/// per-token allocations. `buf` is `clear()`ed first, so one buffer can
-/// be reused across parses (capacity is retained; a fresh buffer gets a
-/// length-based capacity hint, capped to keep pathological text-only
-/// inputs from over-reserving).
+/// Crate-private emission target of the fused core loop.
+///
+/// The core is monomorphized per sink:
+/// * [`ArenaSink`] — the [`TokenBuf`] backend of [`tokenize_into`]
+///   (reproduces the historical direct-`Vec::push` codegen);
+/// * [`CallbackSink`] — the streaming backend of [`for_each_event`]
+///   (hands every event to the user closure, zero arena traffic).
+trait Sink {
+    /// Called once per parsed attribute, before the tag's `emit`.
+    fn push_attr(&mut self, ra: RawAttr);
+    /// Called once per event, in source order. `attr_n` = how many
+    /// `push_attr` calls happened since the previous `emit` (always 0
+    /// for non-start-tags; attributes are never split across events).
+    fn emit(&mut self, kind: u8, a: u32, b: u32, attr_n: u32);
+}
+
+/// Arena sink: appends into the two flat vectors of a [`TokenBuf`].
+struct ArenaSink<'a> {
+    events: &'a mut Vec<Event>,
+    attrs: &'a mut Vec<RawAttr>,
+}
+
+impl Sink for ArenaSink<'_> {
+    #[inline(always)]
+    fn push_attr(&mut self, ra: RawAttr) {
+        self.attrs.push(ra);
+    }
+    #[inline(always)]
+    fn emit(&mut self, kind: u8, a: u32, b: u32, attr_n: u32) {
+        // The arena only grows inside one tag, so the span this tag
+        // pushed starts exactly `attr_n` slots before the current end.
+        let c = self.attrs.len() as u32 - attr_n;
+        self.events.push(Event {
+            kind,
+            a,
+            b,
+            c,
+            d: attr_n,
+        });
+    }
+}
+
+/// Streaming sink: delivers each event to the user closure together
+/// with the tag's own attribute slice. The scratch vector is cleared
+/// after every `emit`, so it never outlives one event.
+struct CallbackSink<'s, F: FnMut(u8, u32, u32, &[RawAttr])> {
+    f: &'s mut F,
+    scratch: Vec<RawAttr>,
+}
+
+impl<F: FnMut(u8, u32, u32, &[RawAttr])> Sink for CallbackSink<'_, F> {
+    #[inline(always)]
+    fn push_attr(&mut self, ra: RawAttr) {
+        self.scratch.push(ra);
+    }
+    #[inline(always)]
+    fn emit(&mut self, kind: u8, a: u32, b: u32, attr_n: u32) {
+        let attrs = &self.scratch[self.scratch.len() - attr_n as usize..];
+        (self.f)(kind, a, b, attrs);
+        self.scratch.clear();
+    }
+}
+
+/// Streaming contract of the fused tokenizer: **one** pass over `src`,
+/// every event delivered to `sink` the moment it is scanned — **no
+/// arena materialization at all**.
+///
+/// `sink` receives `(kind, a, b, attrs)`:
+/// * `kind` — event kind ([`KIND_TEXT`]…), with [`KIND_SELF_CLOSING`]
+///   set on self-closing start tags (same bit convention as [`Event`]);
+/// * `a..b` — the payload/name range in the source buffer (same `[a, b)`
+///   contract as [`Event`]);
+/// * `attrs` — the raw attributes of THIS start tag (empty slice for
+///   every other kind; borrows the tokenizer's scratch, valid only for
+///   the duration of the call).
+///
+/// Token semantics are exactly those of [`tokenize_into`]; the parity
+/// oracle asserts pull ≡ arena ≡ streaming on the full corpus (hand
+/// fixtures, truncated inputs, LCG markup, bench pages).
+pub fn for_each_event<F>(src: &[u8], mut f: F)
+where
+    F: FnMut(u8, u32, u32, &[RawAttr]),
+{
+    tokenize_core(
+        src,
+        &mut CallbackSink {
+            f: &mut f,
+            scratch: Vec::new(),
+        },
+    );
+}
+
+/// Fused tokenizer into a [`TokenBuf`]: a **single** pass over `src`
+/// emitting flat [`Event`]s and attribute ranges into `buf` — no
+/// per-token calls, no per-token allocations. `buf` is `clear()`ed
+/// first, so one buffer can be reused across parses (capacity is
+/// retained; a fresh buffer gets a length-based capacity hint, capped
+/// to keep pathological text-only inputs from over-reserving).
 ///
 /// Token semantics are exactly those of [`Tokenizer::next_token`] (the
 /// same simplified HTML5 state machine: comments run to `-->`, doctypes
@@ -635,23 +749,27 @@ pub fn tokenize_into(src: &[u8], buf: &mut TokenBuf) {
     // hundred bytes, so an uncapped hint would over-reserve hugely.
     buf.events.reserve((src.len() / 16).min(1 << 16));
     buf.attrs.reserve((src.len() / 24).min(1 << 16));
+    tokenize_core(
+        src,
+        &mut ArenaSink {
+            events: &mut buf.events,
+            attrs: &mut buf.attrs,
+        },
+    );
+}
 
+/// The fused core loop: ONE pass over `src`, every token dispatched
+/// inline (no per-token calls) and handed to `sink`, which is
+/// monomorphized per backend — see [`Sink`].
+fn tokenize_core<S: Sink>(src: &[u8], sink: &mut S) {
     let n = src.len();
-    let events = &mut buf.events;
-    let attrs = &mut buf.attrs;
     let mut i = 0usize;
 
     while i < n {
         if src[i] != b'<' {
             // Data state: the bulk of real pages. Hybrid scan for '<'.
             let end = scan_byte(src, i, n, b'<');
-            events.push(Event {
-                kind: KIND_TEXT,
-                a: i as u32,
-                b: end as u32,
-                c: 0,
-                d: 0,
-            });
+            sink.emit(KIND_TEXT, i as u32, end as u32, 0);
             i = end;
             continue;
         }
@@ -660,13 +778,7 @@ pub fn tokenize_into(src: &[u8], buf: &mut TokenBuf) {
         // inlined into this single loop (no per-token calls).
         let Some(next) = src.get(i + 1).copied() else {
             // Lone '<' at EOF: a 1-byte text token.
-            events.push(Event {
-                kind: KIND_TEXT,
-                a: i as u32,
-                b: (i + 1) as u32,
-                c: 0,
-                d: 0,
-            });
+            sink.emit(KIND_TEXT, i as u32, (i + 1) as u32, 0);
             i += 1;
             continue;
         };
@@ -675,26 +787,14 @@ pub fn tokenize_into(src: &[u8], buf: &mut TokenBuf) {
                 // "<!--" → comment up to "-->" (or EOF: truncated).
                 let start = i + 4;
                 let end = find_sub_arrow(&src[start..]).map_or(n, |off| start + off);
-                events.push(Event {
-                    kind: KIND_COMMENT,
-                    a: start as u32,
-                    b: end as u32,
-                    c: 0,
-                    d: 0,
-                });
+                sink.emit(KIND_COMMENT, start as u32, end as u32, 0);
                 i = (end + 3).min(n);
             }
             b'!' => {
                 // "<!" (not comment) → doctype/CDATA-ish blob up to '>'.
                 let start = i + 2;
                 let end = scan_byte(src, start, n, b'>');
-                events.push(Event {
-                    kind: KIND_DOCTYPE,
-                    a: start as u32,
-                    b: end as u32,
-                    c: 0,
-                    d: 0,
-                });
+                sink.emit(KIND_DOCTYPE, start as u32, end as u32, 0);
                 i = (end + 1).min(n);
             }
             b'/' => {
@@ -706,13 +806,7 @@ pub fn tokenize_into(src: &[u8], buf: &mut TokenBuf) {
                 }
                 let name_e = j;
                 let end = scan_byte(src, j, n, b'>');
-                events.push(Event {
-                    kind: KIND_END_TAG,
-                    a: name_s as u32,
-                    b: name_e as u32,
-                    c: 0,
-                    d: 0,
-                });
+                sink.emit(KIND_END_TAG, name_s as u32, name_e as u32, 0);
                 i = (end + 1).min(n);
             }
             first if first.is_ascii_alphabetic() => {
@@ -724,7 +818,7 @@ pub fn tokenize_into(src: &[u8], buf: &mut TokenBuf) {
                     j += 1;
                 }
                 let name_e = j;
-                let attr_from = attrs.len() as u32;
+                let mut attr_n = 0u32;
                 let mut self_closing = false;
                 loop {
                     // before-attribute-name: skip whitespace
@@ -780,10 +874,11 @@ pub fn tokenize_into(src: &[u8], buf: &mut TokenBuf) {
                         None
                     };
                     if name_b > name_a {
-                        attrs.push(RawAttr {
+                        sink.push_attr(RawAttr {
                             name: (name_a as u32, name_b as u32),
                             value,
                         });
+                        attr_n += 1;
                     }
                 }
                 let kind = if self_closing {
@@ -791,23 +886,11 @@ pub fn tokenize_into(src: &[u8], buf: &mut TokenBuf) {
                 } else {
                     KIND_START_TAG
                 };
-                events.push(Event {
-                    kind,
-                    a: name_s as u32,
-                    b: name_e as u32,
-                    c: attr_from,
-                    d: attrs.len() as u32 - attr_from,
-                });
+                sink.emit(kind, name_s as u32, name_e as u32, attr_n);
             }
             _ => {
                 // Lone '<' before anything name-like: literal text byte.
-                events.push(Event {
-                    kind: KIND_TEXT,
-                    a: i as u32,
-                    b: (i + 1) as u32,
-                    c: 0,
-                    d: 0,
-                });
+                sink.emit(KIND_TEXT, i as u32, (i + 1) as u32, 0);
                 i += 1;
             }
         }
@@ -1100,14 +1183,38 @@ mod fused_parity {
         sequence_from_buf(&tokenize(src))
     }
 
+    /// Streaming (callback) output normalized to the same RefTok shape —
+    /// the third leg of the parity oracle.
+    fn callback_sequence(src: &[u8]) -> Vec<RefTok> {
+        let mut out = Vec::new();
+        for_each_event(src, |kind, a, b, attrs| match kind & 0x7F {
+            KIND_TEXT => out.push(RefTok::Text(a as usize, b as usize)),
+            KIND_START_TAG => out.push(RefTok::Start(
+                a as usize,
+                b as usize,
+                kind & KIND_SELF_CLOSING != 0,
+                attrs.iter().map(|ra| (ra.name, ra.value)).collect(),
+            )),
+            KIND_END_TAG => out.push(RefTok::End(a as usize, b as usize)),
+            KIND_COMMENT => out.push(RefTok::Comment(a as usize, b as usize)),
+            KIND_DOCTYPE => out.push(RefTok::Doctype(a as usize, b as usize)),
+            other => panic!("corrupt event kind {other:#x}"),
+        });
+        out
+    }
+
     fn assert_parity(src: &[u8]) {
         let want = ref_sequence(src);
-        let got = fused_sequence(src);
+        let prefix = String::from_utf8_lossy(&src[..src.len().min(96)]);
         assert_eq!(
             want,
-            got,
-            "fused != pull for prefix {:?}",
-            String::from_utf8_lossy(&src[..src.len().min(96)])
+            fused_sequence(src),
+            "fused != pull for prefix {prefix:?}"
+        );
+        assert_eq!(
+            want,
+            callback_sequence(src),
+            "callback != pull for prefix {prefix:?}"
         );
     }
 

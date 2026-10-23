@@ -11,8 +11,8 @@ Firefox-подход к оптимизации браузерных hot-path н�
 | `rustfox-style` | парсер CSS-селекторов + матчеры: `naive` (база), `optimized` (bloom-фильтр предков), `indexed` (rule bucketing), `fast` (v0.8: бит-параллельный NFA + AVX2 + **инкрементальный restyle** по dirty-поддеревьям на preorder), `fast_okc` (direct-mapped ok-cache) |
 | `rustfox-simd` | AVX2/SSE2/SWAR байт-сканирование с кэшем детекции фич и гибридным диспатчем по длине — memchr-слой всех остальных ядер |
 | `rustfox-url` | zero-copy URL-парсер (kernel nsStandardURL): **однопроходный bitmap-движок** (7 структурных байтов за один SIMD-проход), только Range-индексы, ноль аллокаций |
-| `rustfox-html` | zero-copy HTML-токенизатор (kernel nsHtml5Tokenizer): pull-API + **fused-движок** (плоская арена событий, один слитный цикл), 0 аллокаций |
-| `rustfox-http1` | zero-copy HTTP/1.1 заголовки (kernel necko): статус сдвигами, inline×32 + spill |
+| `rustfox-html` | zero-copy HTML-токенизатор (kernel nsHtml5Tokenizer): pull-API + fused-движок (плоская арена событий) + **streaming `for_each_event`** (колбэк в момент скана, без арены и второго прохода), один сканер на три API, 0 аллокаций |
+| `rustfox-http1` | zero-copy HTTP/1.1 заголовки (kernel necko): two-pass с записью концов строк за один SIMD-скан, статус сдвигами, inline×32 + spill |
 
 Текущие результаты (локальный прогон, полный лог — [WORKLOG.md](WORKLOG.md),
 свежие цифры — [bench/latest.json](bench/latest.json)):
@@ -24,9 +24,9 @@ Firefox-подход к оптимизации браузерных hot-path н�
 | restyle 1% dirty @10k | 218 µs | 1.59 ms (full recalc) | **7.3x** |
 | restyle 0.1% dirty @10k | 168 µs | 1.59 ms | **9.4x** |
 | url/parse (202 KiB, bitmap) | 102 µs | 172 µs | **1.68x** |
-| http1/parse (1 MiB) | 695 µs | 1.40 ms | **2.01x** |
-| html/tokenize prose | 97 µs | 194 µs | **1.99x** |
-| html/tokenize dense | 410 µs | 335 µs | 0.82x (честно: materialize-налог арены, скан ≈ naive на ранах 1–15B) |
+| http1/parse (1 MiB) | 671 µs | 1.38 ms | **2.05x** |
+| html/tokenize prose (callback) | 88 µs | 178 µs | **2.03x** |
+| html/tokenize dense (callback) | 384 µs | 282 µs | 0.73x (честно: скан ≈ naive на ранах 1–15B; лучший rustfox-время: было 410 µs у fused) |
 | simd find_byte 4k | 83 ns | 1.17 µs | **14.0x** |
 
 Архитектура `fast` — топ-даун бит-параллельный автомат: переход O(W) u128/AVX2

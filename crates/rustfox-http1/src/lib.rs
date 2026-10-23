@@ -16,11 +16,19 @@
 //!   returns slices into it — version, reason, and every header name and
 //!   value are `&'a [u8]`. The head length is returned so the caller can
 //!   hand the remainder to the body path without any copy.
-//! * **SIMD line scanning**: the head terminator `\r\n\r\n` and every
-//!   line end are found with `rustfox_simd::find_byte(b'\n')` (AVX2,
-//!   32 bytes/step) plus a 3-byte neighbor check; header names locate
-//!   their `:` the same way. Header blocks are small, so this buys
-//!   latency (one vector compare vs a branchy loop), not bandwidth.
+//! * **Two-pass with recorded line ends**: pass 1 finds the head
+//!   terminator `\r\n\r\n` and records the absolute offset of every `\n`
+//!   it steps over (the same offsets pass 2 needs for the status and
+//!   header lines) into a small stack array; the terminator hit itself is
+//!   a single 4-byte compare. On a typical head that removes the second
+//!   full round of per-line `\n` scans (~7 of ~15 searches per response).
+//!   Each scan is `rustfox_simd::find_byte` — its own hybrid dispatch
+//!   (AVX2 ≥ 32 B, inlined SWAR 8–31 B, scalar < 8 B) already matches
+//!   short header lines better than a local probe: the line-end `\n`
+//!   sits 15–45 B into the range, where one 32-byte AVX2 compare beats
+//!   2–6 SWAR steps. Heads with more line ends than the recording cap
+//!   simply fall back to per-line scans mid-parse (correctness never
+//!   depends on the cap).
 //! * **Status digits without `str::parse`**: three ASCII digits are
 //!   decoded with shifts/multiplies — no `Result` plumbing on the hot
 //!   path, no locale/format machinery.
@@ -132,11 +140,14 @@ impl<'a> Response<'a> {
     /// (everything through the `\r\n\r\n` terminator) so the caller can
     /// continue with the body on the same buffer.
     pub fn parse(src: &'a [u8]) -> Result<(Response<'a>, usize), HttpError> {
-        let head_len = find_head_len(src).ok_or(HttpError::NoTerminator)?;
+        let mut ends = [0u32; MAX_LINE_ENDS];
+        let mut n_ends = 0usize;
+        let head_len = find_head_len(src, &mut ends, &mut n_ends).ok_or(HttpError::NoTerminator)?;
         let head = &src[..head_len];
 
         // ---- status line -------------------------------------------------
-        let nl = find_byte(head, b'\n').ok_or(HttpError::BadStatus)?;
+        let mut hit = 0usize;
+        let nl = next_line_end(head, 0, &ends, n_ends, &mut hit).ok_or(HttpError::BadStatus)?;
         let mut le = nl;
         if le > 0 && head[le - 1] == b'\r' {
             le -= 1;
@@ -168,7 +179,8 @@ impl<'a> Response<'a> {
         let mut headers = HeaderList::new();
         let mut pos = nl + 1;
         while pos < head_len {
-            let nl2 = find_byte(&head[pos..], b'\n').ok_or(HttpError::BadHeader)? + pos;
+            let nl2 =
+                next_line_end(head, pos, &ends, n_ends, &mut hit).ok_or(HttpError::BadHeader)?;
             let mut le2 = nl2;
             if le2 > pos && head[le2 - 1] == b'\r' {
                 le2 -= 1;
@@ -236,16 +248,55 @@ impl<'a> Response<'a> {
     }
 }
 
-/// Length of the head including the `\r\n\r\n` terminator.
+/// Cap on recorded line-end offsets (see [`find_head_len`]). A head with
+/// more `\n`s than this consumes the recorded prefix, then continues
+/// with per-line `find_byte` scans — recording degrades, correctness
+/// does not (the recorded offsets are a valid prefix of the hit order).
+const MAX_LINE_ENDS: usize = 40;
+
+/// Next `\n` at or after `pos` in `head`, consuming the offsets pass 1
+/// recorded while they last (they are exactly the `\n` positions from
+/// the buffer start in order, and `parse` requests them in that same
+/// order), falling back to a plain scan once the recording runs out.
+#[inline]
+fn next_line_end(
+    head: &[u8],
+    pos: usize,
+    ends: &[u32; MAX_LINE_ENDS],
+    n_ends: usize,
+    hit: &mut usize,
+) -> Option<usize> {
+    if *hit < n_ends {
+        let e = ends[*hit] as usize;
+        *hit += 1;
+        debug_assert!(e >= pos, "recorded line ends must be non-decreasing vs pos");
+        Some(e)
+    } else {
+        find_byte(&head[pos..], b'\n').map(|off| pos + off)
+    }
+}
+
+/// Length of the head including the `\r\n\r\n` terminator, plus the
+/// absolute offset of every `\n` stepped over on the way (up to
+/// [`MAX_LINE_ENDS`]).
 ///
-/// Scan for `'\n'` with SIMD; each hit is the terminator's final byte iff
-/// its three predecessors are `\r \n \r`. Headers are short, so this
-/// check-per-`'\n'` loop runs a handful of iterations per response.
-fn find_head_len(src: &[u8]) -> Option<usize> {
+/// Each `find_byte` hit is the terminator's final byte iff the 4 bytes
+/// ending at it are `\r\n\r\n` — one 4-byte compare per hit instead of
+/// three neighbor loads. The recorded offsets feed pass 2, which
+/// otherwise re-scans every line end (`\n` hit *k* is the end of line
+/// *k*: status line first, then header lines, then the terminator's own
+/// `\n`, which yields the empty line that stops the header loop).
+#[inline]
+fn find_head_len(src: &[u8], ends: &mut [u32; MAX_LINE_ENDS], n_ends: &mut usize) -> Option<usize> {
     let mut from = 0usize;
+    *n_ends = 0;
     loop {
         let i = find_byte(&src[from..], b'\n')? + from;
-        if i >= 3 && src[i - 1] == b'\r' && src[i - 2] == b'\n' && src[i - 3] == b'\r' {
+        if *n_ends < MAX_LINE_ENDS && i <= u32::MAX as usize {
+            ends[*n_ends] = i as u32;
+            *n_ends += 1;
+        }
+        if i >= 3 && src[i - 3..i + 1] == *b"\r\n\r\n" {
             return Some(i + 1);
         }
         from = i + 1;
@@ -428,5 +479,54 @@ X-Trace: trace-7-42\r\n\
         hl.clear();
         assert!(hl.is_empty());
         assert_eq!(hl.get(b"late"), None);
+    }
+
+    // ---- recorded line ends (two-pass fusion) -----------------------------
+
+    fn head_with_n_headers(n: usize) -> Vec<u8> {
+        let mut head = b"HTTP/1.1 200 OK\r\n".to_vec();
+        for i in 0..n {
+            head.extend_from_slice(format!("X-{i:02}: v{i}\r\n").as_bytes());
+        }
+        head.extend_from_slice(b"\r\n");
+        head
+    }
+
+    #[test]
+    fn line_ends_at_and_past_recording_cap() {
+        // hits = status `\n` + H header `\n`s + terminator `\n` = H + 2.
+        // H = 38 → exactly MAX_LINE_ENDS hits: fully recorded path.
+        // H = 39 and H = 45 → the recording caps mid-head and the parse
+        // finishes on per-line find_byte scans. All must parse identically.
+        for h in [MAX_LINE_ENDS - 2, MAX_LINE_ENDS - 1, MAX_LINE_ENDS + 5] {
+            let src = head_with_n_headers(h);
+            let (resp, used) = Response::parse(&src).unwrap_or_else(|e| panic!("h={h}: {e:?}"));
+            assert_eq!(used, src.len(), "h={h}");
+            assert_eq!(resp.n_headers(), h, "h={h}");
+            assert_eq!(resp.status, 200);
+            let mid = format!("X-{:02}", h / 2).into_bytes();
+            assert_eq!(
+                resp.header(&mid),
+                Some(format!("v{}", h / 2).as_bytes()),
+                "h={h}"
+            );
+            let last = format!("X-{:02}", h - 1).into_bytes();
+            assert_eq!(
+                resp.header(&last),
+                Some(format!("v{}", h - 1).as_bytes()),
+                "h={h}"
+            );
+        }
+    }
+
+    #[test]
+    fn line_ends_no_headers_and_body_tail() {
+        // Two recorded hits (status + terminator), empty line stops the
+        // loop. The head INCLUDES the \r\n\r\n terminator: 14 + 2 = 16.
+        let src = b"HTTP/1.1 204\r\n\r\nbody-here";
+        let (resp, used) = Response::parse(src).unwrap();
+        assert_eq!(used, 16);
+        assert_eq!(resp.n_headers(), 0);
+        assert_eq!(&src[used..], b"body-here");
     }
 }

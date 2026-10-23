@@ -8,19 +8,23 @@
 //!   arena: a single pass with no per-token calls (events + attributes
 //!   pushed into flat vectors during the scan), then one aggregation
 //!   pass over the events.
+//! * `rf-callback` — `for_each_event`: the SAME single-pass scanner with
+//!   a streaming sink — events are consumed at emission time (zero
+//!   arena materialization, no second pass). This is the Iteration 8
+//!   answer to the fused API's materialize-then-consume tax.
 //! * `naive-bytewise` — an equally correct, deliberately dumb byte-by-byte
 //!   scanner with the same semantics (no SIMD, no slices, no arena),
 //!   counting the same aggregates inline.
 //!
-//! The setup runs all three once and asserts that all six aggregate
+//! The setup runs all four once and asserts that all six aggregate
 //! counters (text/start/end/comment/doctype/attrs) match across them —
 //! otherwise it panics with the mismatching counters, so the numbers can
 //! never compare apples to oranges.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use rustfox_html::{
-    tokenize, tokenize_into, Attrs, Token, TokenBuf, Tokenizer, KIND_COMMENT, KIND_DOCTYPE,
-    KIND_END_TAG, KIND_START_TAG, KIND_TEXT,
+    for_each_event, tokenize, tokenize_into, Attrs, Token, TokenBuf, Tokenizer, KIND_COMMENT,
+    KIND_DOCTYPE, KIND_END_TAG, KIND_START_TAG, KIND_TEXT,
 };
 use std::time::Duration;
 
@@ -171,6 +175,24 @@ fn count_with_fused(page: &[u8]) -> Counts {
     counts_from_events(&tokenize(page))
 }
 
+/// Aggregate counters from the streaming (callback) tokenizer: zero
+/// arena materialization — events are consumed at emission time.
+fn count_with_callback(page: &[u8]) -> Counts {
+    let mut c = Counts::default();
+    for_each_event(page, |kind, _a, _b, attrs| match kind & 0x7F {
+        KIND_TEXT => c.text += 1,
+        KIND_START_TAG => {
+            c.start += 1;
+            c.attrs += attrs.len() as u64;
+        }
+        KIND_END_TAG => c.end += 1,
+        KIND_COMMENT => c.comment += 1,
+        KIND_DOCTYPE => c.doctype += 1,
+        other => unreachable!("corrupt event kind {other:#x}"),
+    });
+    c
+}
+
 /// Honest naive baseline: byte-by-byte scanner with the same simplified
 /// HTML5 semantics, counting the same aggregates. One branch per byte.
 fn count_with_naive(src: &[u8]) -> Counts {
@@ -307,14 +329,19 @@ fn bench_tokenize(c: &mut Criterion) {
     let dense = build_page_dense();
     let prose = build_page_prose();
 
-    // Setup parity: all three implementations must agree on every aggregate.
+    // Setup parity: all four implementations must agree on every aggregate.
     for (name, page) in [("dense", &dense), ("prose", &prose)] {
         let rf = count_with_rf(page);
         let fused = count_with_fused(page);
+        let callback = count_with_callback(page);
         let naive = count_with_naive(page);
         assert_eq!(
             rf, fused,
             "rf-pull and rf-fused disagree on aggregate token counts ({name})"
+        );
+        assert_eq!(
+            rf, callback,
+            "rf-pull and rf-callback disagree on aggregate token counts ({name})"
         );
         assert_eq!(
             rf, naive,
@@ -361,6 +388,14 @@ fn bench_tokenize(c: &mut Criterion) {
                 // reuse pattern of the pull tokenizer).
                 tokenize_into(page, &mut buf);
                 black_box(counts_from_events(&buf))
+            })
+        });
+        group.bench_function(format!("rf-callback/{name}"), |b| {
+            b.iter(|| {
+                // Streaming contract: consume events at emission time —
+                // no arena, no second pass (the tree-builder-shaped
+                // consumption the dense fixture was missing).
+                black_box(count_with_callback(page))
             })
         });
         group.bench_function(format!("naive-bytewise/{name}"), |b| {
